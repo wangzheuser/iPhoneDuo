@@ -87,7 +87,9 @@ def main():
         if service and service.submitted:
             message += ' 订单提交结果可能未确认，请查询订单后再决定下一步。'
         channel.emit('error', message=message[:2000], order_submitted=bool(service and service.submitted),
-                     account_invalid=bool(service and service.should_remove_account(exc)))
+                     account_invalid=bool(service and service.should_remove_account(exc)),
+                     retryable=bool(service and service.retryable(exc)),
+                     side_effect=service.side_effect if service else 'unknown')
     finally:
         if service:
             try:

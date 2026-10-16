@@ -45,6 +45,8 @@ export function localWebBridge(): Bridge {
   }
   return {
     snapshot: () => call("snapshot"),
+    createSchedule: (request) => call("create_schedule", { request }),
+    cancelSchedule: (scheduleId) => call("cancel_schedule", { scheduleId }),
     add: (email) => call("add_account", { email }),
     remove: (accountId) => call("remove_account", { accountId }),
     savePreset: (accountId, sku, quantity) =>

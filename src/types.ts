@@ -44,11 +44,42 @@ export interface Task {
   prompt: Prompt | null;
   result: Data | null;
   order_submitted: boolean;
+  retryable?: boolean;
+  side_effect?: string;
   logs: string[];
+}
+export interface Schedule {
+  id: string;
+  account_id: string;
+  sku: string;
+  quantity: number;
+  start_at_ms: number;
+  deadline_at_ms: number;
+  interval_ms: number;
+  max_attempts: number;
+  attempts: number;
+  auto_confirm: boolean;
+  max_total?: string | null;
+  status: string;
+  current_task_id?: string | null;
+  next_attempt_at_ms?: number | null;
+  last_error: string;
+}
+export interface ScheduleRequest {
+  accountId: string;
+  sku: string;
+  quantity: number;
+  startAtMs: number;
+  deadlineAtMs: number;
+  intervalMs: number;
+  maxAttempts: number;
+  autoConfirm: boolean;
+  maxTotal?: string;
 }
 export interface Snapshot {
   accounts: Account[];
   tasks: Task[];
+  schedules: Schedule[];
   data_dir: string;
   defaults?: Account;
 }

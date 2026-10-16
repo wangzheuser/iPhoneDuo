@@ -1,10 +1,11 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, type FormEvent } from "react";
 import {
   LoaderCircle,
   RefreshCw,
   Settings2,
   Radio,
   LayoutDashboard,
+  Clock3,
 } from "lucide-react";
 import type { Bridge } from "./api";
 import {
@@ -14,6 +15,7 @@ import {
   type Account,
   type Action,
   type Data,
+  type ScheduleRequest,
   type Snapshot,
   type Task,
 } from "./types";
@@ -22,13 +24,15 @@ import { useAccountPrivacy } from "./AccountPrivacy";
 import { AddressForm } from "./AddressForm";
 import { SelectField } from "./SelectField";
 
-export type Route = "workspace" | "settings" | "duo";
+export type Route = "workspace" | "settings" | "duo" | "schedule";
 const readRoute = (): Route =>
   location.hash === "#/settings"
     ? "settings"
     : location.hash === "#/duo"
       ? "duo"
-      : "workspace";
+      : location.hash === "#/schedule"
+        ? "schedule"
+        : "workspace";
 export function useRoute() {
   const [route, setRoute] = useState<Route>(readRoute);
   useEffect(() => {
@@ -58,6 +62,7 @@ export function RouteNav({
           ["workspace", "账号工作台", LayoutDashboard],
           ["settings", "本地配置", Settings2],
           ["duo", "DUO 状态", Radio],
+          ["schedule", "定时抢单", Clock3],
         ] as const
       ).map(([id, label, Icon]) => (
         <a
@@ -101,11 +106,305 @@ export function ProductSelect({
     />
   );
 }
+function localDateTime(ms: number) {
+  const date = new Date(ms);
+  const pad = (value: number) => String(value).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+function dateTimeText(ms: number) {
+  return new Date(ms).toLocaleString("zh-CN", { hour12: false });
+}
+const scheduleLabels: Record<string, string> = {
+  armed: "待执行",
+  running: "尝试中",
+  waiting: "等待输入",
+  retrying: "等待下一次尝试",
+  succeeded: "已下单",
+  failed: "失败",
+  cancelled: "已取消",
+  expired: "已结束",
+  unknown: "结果不确定",
+};
 type PageProps = {
   snapshot: Snapshot;
   bridge: Bridge;
   refresh: () => Promise<void>;
 };
+export function SchedulePage({ snapshot, bridge, refresh }: PageProps) {
+  const { format } = useAccountPrivacy();
+  const accounts = snapshot.accounts.filter((account) => !account.pending);
+  const [accountId, setAccountId] = useState(accounts[0]?.id || "");
+  const account = accounts.find((item) => item.id === accountId);
+  const now = Date.now();
+  const [sku, setSku] = useState(account?.preset_sku || "MK2U4CH");
+  const [quantity, setQuantity] = useState(account?.preset_quantity || 1);
+  const [startAt, setStartAt] = useState(localDateTime(now + 60_000));
+  const [deadlineAt, setDeadlineAt] = useState(localDateTime(now + 120_000));
+  const [interval, setInterval] = useState(5);
+  const [maxAttempts, setMaxAttempts] = useState(10);
+  const [autoConfirm, setAutoConfirm] = useState(false);
+  const [maxTotal, setMaxTotal] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [message, setMessage] = useState("");
+  const [error, setError] = useState("");
+  const schedules = snapshot.schedules || [];
+
+  useEffect(() => {
+    const timer = window.setInterval(() => void refresh(), 1000);
+    return () => window.clearInterval(timer);
+  }, [refresh]);
+  useEffect(() => {
+    setSku(account?.preset_sku || "MK2U4CH");
+    setQuantity(account?.preset_quantity || 1);
+  }, [account?.id, account?.preset_sku, account?.preset_quantity]);
+
+  async function submit(event: FormEvent) {
+    event.preventDefault();
+    setSaving(true);
+    setError("");
+    setMessage("");
+    const start = new Date(startAt).getTime();
+    const deadline = new Date(deadlineAt).getTime();
+    if (!accountId || !Number.isFinite(start) || !Number.isFinite(deadline)) {
+      setError("请选择账号和有效的执行时间。");
+      setSaving(false);
+      return;
+    }
+    const request: ScheduleRequest = {
+      accountId,
+      sku,
+      quantity,
+      startAtMs: start,
+      deadlineAtMs: deadline,
+      intervalMs: interval * 1000,
+      maxAttempts,
+      autoConfirm,
+      ...(autoConfirm ? { maxTotal } : {}),
+    };
+    try {
+      await bridge.createSchedule(request);
+      await refresh();
+      setMessage("定时抢单计划已保存");
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <main className="local-page schedule-page">
+      <header className="local-heading">
+        <h1>定时抢单</h1>
+        <p>一次性执行，在时间窗口内有限重试；应用需要保持运行。</p>
+      </header>
+      <section className="section schedule-create">
+        <div className="section-title">
+          <h2>新建计划</h2>
+        </div>
+        {accounts.length === 0 ? (
+          <p className="muted">请先添加并完成登录验证的账号。</p>
+        ) : (
+          <form onSubmit={submit}>
+            <div className="buy-fields">
+              <SelectField
+                label="账号"
+                value={accountId}
+                onChange={setAccountId}
+                options={accounts.map((item) => ({
+                  value: item.id,
+                  label: format(`${item.name} · ${item.email}`),
+                }))}
+              />
+              <label>
+                商品 SKU
+                <input
+                  required
+                  value={sku}
+                  onChange={(e) => setSku(e.target.value.toUpperCase())}
+                />
+              </label>
+              <label>
+                数量
+                <input
+                  type="number"
+                  min={1}
+                  max={999}
+                  required
+                  value={quantity}
+                  onChange={(e) => setQuantity(Number(e.target.value))}
+                />
+              </label>
+              <label>
+                开始时间
+                <input
+                  type="datetime-local"
+                  step={1}
+                  required
+                  value={startAt}
+                  onChange={(e) => setStartAt(e.target.value)}
+                />
+              </label>
+              <label>
+                截止时间
+                <input
+                  type="datetime-local"
+                  step={1}
+                  required
+                  value={deadlineAt}
+                  onChange={(e) => setDeadlineAt(e.target.value)}
+                />
+              </label>
+              <label>
+                尝试间隔（秒）
+                <input
+                  type="number"
+                  min={1}
+                  max={60}
+                  required
+                  value={interval}
+                  onChange={(e) => setInterval(Number(e.target.value))}
+                />
+              </label>
+              <label>
+                最大尝试次数
+                <input
+                  type="number"
+                  min={1}
+                  max={100}
+                  required
+                  value={maxAttempts}
+                  onChange={(e) => setMaxAttempts(Number(e.target.value))}
+                />
+              </label>
+            </div>
+            <label className="checkbox-row">
+              <input
+                type="checkbox"
+                checked={autoConfirm}
+                onChange={(e) => setAutoConfirm(e.target.checked)}
+              />
+              自动确认创建订单（仍不会自动付款）
+            </label>
+            {autoConfirm && (
+              <label>
+                最高总金额（人民币）
+                <input
+                  required
+                  inputMode="decimal"
+                  value={maxTotal}
+                  onChange={(e) => setMaxTotal(e.target.value)}
+                  placeholder="例如 5999"
+                />
+              </label>
+            )}
+            <p className="muted schedule-note">
+              进入购物袋修改、结账或订单提交后不会自动重试；结果不确定时请先查询订单。
+            </p>
+            <div className="button-row">
+              <button
+                className="primary"
+                type="submit"
+                disabled={saving || !accountId}
+              >
+                保存计划
+              </button>
+              {message && <span role="status">{message}</span>}
+            </div>
+            {error && (
+              <p role="alert" className="error-text">
+                {error}
+              </p>
+            )}
+          </form>
+        )}
+      </section>
+      <section className="section">
+        <div className="section-title">
+          <h2>已有计划</h2>
+        </div>
+        {schedules.length === 0 ? (
+          <p className="muted">暂无定时抢单计划。</p>
+        ) : (
+          <div className="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>账号 / 商品</th>
+                  <th>执行窗口</th>
+                  <th>尝试</th>
+                  <th>状态</th>
+                  <th />
+                </tr>
+              </thead>
+              <tbody>
+                {schedules.map((schedule) => {
+                  const owner = snapshot.accounts.find(
+                    (item) => item.id === schedule.account_id,
+                  );
+                  const canCancel = [
+                    "armed",
+                    "retrying",
+                    "running",
+                    "waiting",
+                  ].includes(schedule.status);
+                  return (
+                    <tr key={schedule.id}>
+                      <td>
+                        <strong>
+                          {format(owner?.name || schedule.account_id)}
+                        </strong>
+                        <br />
+                        <small>
+                          {format(owner?.email || "")} · {schedule.sku} ×{" "}
+                          {schedule.quantity}
+                        </small>
+                      </td>
+                      <td>
+                        <small>
+                          {dateTimeText(schedule.start_at_ms)}
+                          <br />至 {dateTimeText(schedule.deadline_at_ms)}
+                        </small>
+                      </td>
+                      <td>
+                        {schedule.attempts} / {schedule.max_attempts}
+                      </td>
+                      <td>
+                        <span className={`status ${schedule.status}`}>
+                          {scheduleLabels[schedule.status] || schedule.status}
+                        </span>
+                        {schedule.last_error && (
+                          <small className="error-text">
+                            {schedule.last_error}
+                          </small>
+                        )}
+                      </td>
+                      <td>
+                        {canCancel && (
+                          <button
+                            className="text-button"
+                            onClick={() =>
+                              bridge
+                                .cancelSchedule(schedule.id)
+                                .then(refresh)
+                                .catch((e) => setError(String(e)))
+                            }
+                          >
+                            取消
+                          </button>
+                        )}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </section>
+    </main>
+  );
+}
 function TaskStatus({ task, cancel }: { task?: Task; cancel: () => void }) {
   if (!task) return null;
   return (

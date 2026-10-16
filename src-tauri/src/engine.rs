@@ -12,7 +12,7 @@ use std::{
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::Command,
-    sync::{mpsc, watch, Semaphore},
+    sync::{mpsc, watch, Notify, Semaphore},
 };
 use uuid::Uuid;
 
@@ -58,8 +58,17 @@ fn now() -> u64 {
         .unwrap_or_default()
         .as_secs()
 }
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
 pub fn terminal(status: &str) -> bool {
     matches!(status, "succeeded" | "failed" | "cancelled" | "interrupted")
+}
+fn active_status(status: &str) -> bool {
+    matches!(status, "queued" | "running" | "waiting")
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -92,12 +101,60 @@ pub struct Task {
     pub prompt: Option<Value>,
     pub result: Option<Value>,
     pub order_submitted: bool,
+    #[serde(default)]
+    pub retryable: bool,
+    #[serde(default = "default_side_effect")]
+    pub side_effect: String,
     pub logs: Vec<String>,
+}
+fn default_side_effect() -> String {
+    "none".into()
+}
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Schedule {
+    pub id: String,
+    pub account_id: String,
+    pub sku: String,
+    pub quantity: u32,
+    pub start_at_ms: u64,
+    pub deadline_at_ms: u64,
+    pub interval_ms: u64,
+    pub max_attempts: u32,
+    pub attempts: u32,
+    pub auto_confirm: bool,
+    pub max_total: Option<String>,
+    pub status: String,
+    pub current_task_id: Option<String>,
+    pub next_attempt_at_ms: Option<u64>,
+    pub last_error: String,
+}
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScheduleRequest {
+    pub account_id: String,
+    pub sku: String,
+    pub quantity: u32,
+    pub start_at_ms: u64,
+    pub deadline_at_ms: u64,
+    #[serde(default = "default_interval_ms")]
+    pub interval_ms: u64,
+    #[serde(default = "default_max_attempts")]
+    pub max_attempts: u32,
+    #[serde(default)]
+    pub auto_confirm: bool,
+    pub max_total: Option<String>,
+}
+fn default_interval_ms() -> u64 {
+    5_000
+}
+fn default_max_attempts() -> u32 {
+    10
 }
 #[derive(Serialize)]
 pub struct Snapshot {
     pub accounts: Vec<Account>,
     pub tasks: Vec<Task>,
+    pub schedules: Vec<Schedule>,
     pub data_dir: String,
     pub defaults: Account,
 }
@@ -134,6 +191,9 @@ pub struct Engine {
     controls: Mutex<HashMap<String, Control>>,
     locks: Mutex<HashMap<String, Arc<Semaphore>>>,
     defaults: Mutex<Account>,
+    schedules: Mutex<HashMap<String, Schedule>>,
+    schedule_notify: Notify,
+    scheduler_stop: watch::Sender<bool>,
     removing: Mutex<HashSet<String>>,
 }
 
@@ -209,6 +269,55 @@ impl Engine {
                 }
             }
         }
+        let schedules_path = root.join("schedules.json");
+        let schedule_rows: Vec<Schedule> = if schedules_path.exists() {
+            serde_json::from_slice(&fs::read(&schedules_path).map_err(|e| e.to_string())?)
+                .map_err(|e| format!("定时抢单配置格式损坏：{e}"))?
+        } else {
+            vec![]
+        };
+        let account_ids: HashSet<_> = accounts.iter().map(|account| account.id.as_str()).collect();
+        let current_ms = now_ms();
+        let mut schedules = HashMap::new();
+        let mut schedules_changed = false;
+        for mut schedule in schedule_rows {
+            if Uuid::parse_str(&schedule.id).is_err()
+                || Uuid::parse_str(&schedule.account_id).is_err()
+                || !account_ids.contains(schedule.account_id.as_str())
+            {
+                continue;
+            }
+            if matches!(
+                schedule.status.as_str(),
+                "armed" | "retrying" | "running" | "waiting"
+            ) {
+                let task = schedule
+                    .current_task_id
+                    .as_ref()
+                    .and_then(|id| tasks.get(id));
+                if task.is_some_and(|task| task.order_submitted) {
+                    schedule.status = "unknown".into();
+                    schedule.last_error = "应用退出时订单提交结果未知，请先查询订单".into();
+                    schedule.next_attempt_at_ms = None;
+                } else if schedule.deadline_at_ms <= current_ms {
+                    schedule.status = "expired".into();
+                    schedule.next_attempt_at_ms = None;
+                } else if task.is_some_and(|task| task.status == "succeeded") {
+                    schedule.status = "succeeded".into();
+                    schedule.next_attempt_at_ms = None;
+                } else {
+                    schedule.status = "armed".into();
+                    schedule.next_attempt_at_ms = Some(schedule.start_at_ms.max(current_ms));
+                }
+                schedules_changed = true;
+            }
+            schedules.insert(schedule.id.clone(), schedule);
+        }
+        if schedules_changed {
+            let rows: Vec<_> = schedules.values().cloned().collect();
+            private_json(&schedules_path, &rows)?;
+        }
+        let (scheduler_stop, _) = watch::channel(false);
         Ok(Arc::new(Self {
             root,
             accounts: Mutex::new(accounts),
@@ -216,15 +325,21 @@ impl Engine {
             controls: Mutex::new(HashMap::new()),
             locks: Mutex::new(HashMap::new()),
             defaults: Mutex::new(defaults),
+            schedules: Mutex::new(schedules),
+            schedule_notify: Notify::new(),
+            scheduler_stop,
             removing: Mutex::new(HashSet::new()),
         }))
     }
     pub fn snapshot(&self) -> Snapshot {
         let mut tasks: Vec<_> = self.tasks.lock().unwrap().values().cloned().collect();
         tasks.sort_by_key(|t| std::cmp::Reverse(t.created_at));
+        let mut schedules: Vec<_> = self.schedules.lock().unwrap().values().cloned().collect();
+        schedules.sort_by_key(|s| s.start_at_ms);
         Snapshot {
             accounts: self.accounts.lock().unwrap().clone(),
             tasks,
+            schedules,
             data_dir: self.root.to_string_lossy().into(),
             defaults: self.defaults.lock().unwrap().clone(),
         }
@@ -272,26 +387,45 @@ impl Engine {
         if removing.contains(id) {
             return Err("这个账号正在移除，请稍候".into());
         }
-        let tasks = self.tasks.lock().unwrap();
-        let controls = self.controls.lock().unwrap();
-        if tasks.values().any(|t| {
-            t.account_id == id && (!terminal(&t.status) || controls.contains_key(&t.id))
-        }) {
+        let busy_task = {
+            let tasks = self.tasks.lock().unwrap();
+            let controls = self.controls.lock().unwrap();
+            tasks.values().any(|t| {
+                t.account_id == id && (!terminal(&t.status) || controls.contains_key(&t.id))
+            })
+        };
+        let busy_schedule = self.schedules.lock().unwrap().values().any(|schedule| {
+            schedule.account_id == id
+                && matches!(
+                    schedule.status.as_str(),
+                    "armed" | "retrying" | "running" | "waiting"
+                )
+        });
+        if busy_task || busy_schedule {
             return Err("该账号仍有任务执行或收尾中，请完成或取消后再移除".into());
         }
         removing.insert(id.into());
-        Ok(AccountRemoval { engine: self, id: id.into() })
+        Ok(AccountRemoval {
+            engine: self,
+            id: id.into(),
+        })
     }
     pub async fn remove_account(&self, host: &TaskHost, id: &str) -> Result<(), String> {
         let _reservation = self.reserve_removal(id)?;
         // Use the same OS vault as login; no Apple requests or credentials on stdout.
         let mut command = host.command()?;
-        command.arg("--forget-account").arg(id)
-            .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null())
+        command
+            .arg("--forget-account")
+            .arg(id)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .kill_on_drop(true);
-        #[cfg(windows)] command.creation_flags(0x08000000);
+        #[cfg(windows)]
+        command.creation_flags(0x08000000);
         let status = tokio::time::timeout(std::time::Duration::from_secs(30), command.status())
-            .await.map_err(|_| "清理保存密码超时，账号尚未移除，请重试")?
+            .await
+            .map_err(|_| "清理保存密码超时，账号尚未移除，请重试")?
             .map_err(|_| "无法启动凭据清理，账号尚未移除，请重试")?;
         if !status.success() {
             return Err("无法清除系统保存的密码，账号尚未移除，请检查凭据保险库后重试".into());
@@ -310,6 +444,9 @@ impl Engine {
         private_json(&self.root.join("accounts.json"), &next)?;
         *accounts = next;
         self.tasks.lock().unwrap().retain(|_, t| t.account_id != id);
+        let mut schedules = self.schedules.lock().unwrap();
+        schedules.retain(|_, schedule| schedule.account_id != id);
+        self.persist_schedules(&schedules)?;
         self.locks.lock().unwrap().remove(id);
         Ok(())
     }
@@ -379,6 +516,330 @@ impl Engine {
         private_json(&self.root.join("accounts.json"), &next)?;
         *accounts = next;
         Ok(result)
+    }
+    fn persist_schedules(&self, schedules: &HashMap<String, Schedule>) -> Result<(), String> {
+        let rows: Vec<_> = schedules.values().cloned().collect();
+        private_json(&self.root.join("schedules.json"), &rows)
+    }
+    /// Create one durable, one-shot purchase schedule.
+    pub fn create_schedule(&self, request: ScheduleRequest) -> Result<Schedule, String> {
+        let sku = request.sku.trim().to_ascii_uppercase();
+        if sku.is_empty()
+            || sku.len() > 30
+            || !sku.chars().all(|c| c.is_ascii_alphanumeric() || c == '/')
+        {
+            return Err("请填写有效的 SKU".into());
+        }
+        if !(1..=999).contains(&request.quantity) {
+            return Err("数量须为 1–999 的整数".into());
+        }
+        if request.start_at_ms >= request.deadline_at_ms {
+            return Err("截止时间必须晚于开始时间".into());
+        }
+        if !(1_000..=60_000).contains(&request.interval_ms) {
+            return Err("尝试间隔须为 1–60 秒".into());
+        }
+        if !(1..=100).contains(&request.max_attempts) {
+            return Err("最大尝试次数须为 1–100 次".into());
+        }
+        let max_total = request.max_total.map(|value| value.trim().to_owned());
+        if max_total.as_ref().is_some_and(|value| {
+            value.is_empty()
+                || value.matches('.').count() > 1
+                || !value
+                    .chars()
+                    .all(|character| character.is_ascii_digit() || character == '.')
+        }) {
+            return Err("最高总金额格式无效".into());
+        }
+        if request.auto_confirm {
+            if max_total.as_deref().is_none_or(str::is_empty) {
+                return Err("自动确认下单必须设置最高总金额".into());
+            }
+        }
+        if max_total.as_ref().is_some_and(|value| value.len() > 32) {
+            return Err("最高总金额格式过长".into());
+        }
+        let account = self
+            .accounts
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|account| account.id == request.account_id)
+            .cloned()
+            .ok_or("账号不存在")?;
+        if account.pending {
+            return Err("请先完成账号添加与登录验证".into());
+        }
+        let mut schedules = self.schedules.lock().unwrap();
+        if schedules.values().any(|schedule| {
+            schedule.account_id == account.id
+                && matches!(
+                    schedule.status.as_str(),
+                    "armed" | "retrying" | "running" | "waiting"
+                )
+        }) {
+            return Err("该账号已有正在等待的定时抢单计划".into());
+        }
+        let id = Uuid::new_v4().to_string();
+        let schedule = Schedule {
+            id: id.clone(),
+            account_id: account.id,
+            sku,
+            quantity: request.quantity,
+            start_at_ms: request.start_at_ms,
+            deadline_at_ms: request.deadline_at_ms,
+            interval_ms: request.interval_ms,
+            max_attempts: request.max_attempts,
+            attempts: 0,
+            auto_confirm: request.auto_confirm,
+            max_total,
+            status: "armed".into(),
+            current_task_id: None,
+            next_attempt_at_ms: Some(request.start_at_ms),
+            last_error: String::new(),
+        };
+        schedules.insert(id, schedule.clone());
+        self.persist_schedules(&schedules)?;
+        drop(schedules);
+        self.schedule_notify.notify_one();
+        Ok(schedule)
+    }
+    /// Cancel a schedule and its currently running attempt.
+    pub fn cancel_schedule(&self, id: &str) -> Result<(), String> {
+        let (account_id, task_id) = {
+            let mut schedules = self.schedules.lock().unwrap();
+            let schedule = schedules.get_mut(id).ok_or("定时抢单计划不存在")?;
+            if matches!(
+                schedule.status.as_str(),
+                "succeeded" | "failed" | "cancelled" | "expired" | "unknown"
+            ) {
+                return Ok(());
+            }
+            schedule.status = "cancelled".into();
+            schedule.next_attempt_at_ms = None;
+            (
+                schedule.account_id.clone(),
+                schedule.current_task_id.clone(),
+            )
+        };
+        self.persist_schedules(&self.schedules.lock().unwrap())?;
+        if let Some(task_id) = task_id {
+            let _ = self.cancel(&account_id, &task_id);
+        }
+        self.schedule_notify.notify_one();
+        Ok(())
+    }
+    /// Start the durable scheduler once for the owning application process.
+    pub fn start_scheduler(self: &Arc<Self>, host: TaskHost) {
+        let engine = self.clone();
+        let run = async move {
+            let mut stop = engine.scheduler_stop.subscribe();
+            loop {
+                let delay = engine.next_schedule_delay();
+                tokio::select! {
+                    _ = stop.changed() => break,
+                    _ = engine.schedule_notify.notified() => {},
+                    _ = tokio::time::sleep(delay) => engine.dispatch_due(&host).await,
+                }
+            }
+        };
+        if tokio::runtime::Handle::try_current().is_ok() {
+            tokio::spawn(run);
+        } else {
+            // Tauri calls setup on the macOS application thread, outside Tokio.
+            // Own a small runtime so scheduled plans also work from `./run.sh`.
+            std::thread::Builder::new()
+                .name("duo-killer-scheduler".into())
+                .spawn(|| {
+                    tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .expect("无法创建定时抢单运行时")
+                        .block_on(run);
+                })
+                .expect("无法启动定时抢单线程");
+        }
+    }
+    fn next_schedule_delay(&self) -> std::time::Duration {
+        let now = now_ms();
+        let next = self
+            .schedules
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|schedule| matches!(schedule.status.as_str(), "armed" | "retrying"))
+            .filter_map(|schedule| schedule.next_attempt_at_ms)
+            .min();
+        match next {
+            Some(at) if at <= now => std::time::Duration::from_millis(0),
+            Some(at) => std::time::Duration::from_millis(at - now),
+            None => std::time::Duration::from_secs(3600),
+        }
+    }
+    async fn dispatch_due(self: &Arc<Self>, host: &TaskHost) {
+        let now = now_ms();
+        let ids: Vec<_> = self
+            .schedules
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|schedule| {
+                matches!(schedule.status.as_str(), "armed" | "retrying")
+                    && schedule.next_attempt_at_ms.is_some_and(|at| at <= now)
+            })
+            .map(|schedule| schedule.id.clone())
+            .collect();
+        for id in ids {
+            self.dispatch_schedule(host.clone(), id).await;
+        }
+    }
+    async fn dispatch_schedule(self: &Arc<Self>, host: TaskHost, id: String) {
+        let schedule = {
+            let mut schedules = self.schedules.lock().unwrap();
+            let Some(schedule) = schedules.get_mut(&id) else {
+                return;
+            };
+            if !matches!(schedule.status.as_str(), "armed" | "retrying")
+                || schedule.next_attempt_at_ms.is_none_or(|at| at > now_ms())
+            {
+                return;
+            }
+            if schedule.attempts >= schedule.max_attempts || schedule.deadline_at_ms <= now_ms() {
+                schedule.status = "expired".into();
+                schedule.next_attempt_at_ms = None;
+                let _ = self.persist_schedules(&schedules);
+                return;
+            }
+            schedule.attempts += 1;
+            schedule.status = "running".into();
+            schedule.current_task_id = None;
+            schedule.next_attempt_at_ms = None;
+            let cloned = schedule.clone();
+            let _ = self.persist_schedules(&schedules);
+            cloned
+        };
+        let params = json!({
+            "sku": schedule.sku,
+            "quantity": schedule.quantity,
+            "scheduled": true,
+            "auto_confirm": schedule.auto_confirm,
+            "max_total": schedule.max_total,
+        });
+        match self.start(
+            host.clone(),
+            schedule.account_id.clone(),
+            "purchase".into(),
+            params,
+        ) {
+            Ok(task_id) => {
+                let mut schedules = self.schedules.lock().unwrap();
+                if let Some(current) = schedules.get_mut(&id) {
+                    current.current_task_id = Some(task_id.clone());
+                    let _ = self.persist_schedules(&schedules);
+                }
+                drop(schedules);
+                let engine = self.clone();
+                tokio::spawn(async move {
+                    engine.observe_schedule(host, id, task_id).await;
+                });
+            }
+            Err(error) => {
+                self.finish_schedule(&id, "failed", Some(error));
+            }
+        }
+    }
+    async fn observe_schedule(self: Arc<Self>, _host: TaskHost, id: String, task_id: String) {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            let schedule = self.schedules.lock().unwrap().get(&id).cloned();
+            let Some(schedule) = schedule else { return };
+            if schedule.status == "cancelled" {
+                let _ = self.cancel(&schedule.account_id, &task_id);
+                return;
+            }
+            let task = self.tasks.lock().unwrap().get(&task_id).cloned();
+            let Some(task) = task else { continue };
+            if active_status(&task.status) {
+                if task.status == "waiting" && schedule.status != "waiting" {
+                    self.update_schedule_status(&id, "waiting", None, None);
+                }
+                continue;
+            }
+            if task.status == "succeeded" {
+                self.finish_schedule(&id, "succeeded", None);
+                return;
+            }
+            if task.status == "cancelled" {
+                self.finish_schedule(&id, "cancelled", None);
+                return;
+            }
+            if task.order_submitted {
+                self.finish_schedule(
+                    &id,
+                    "unknown",
+                    Some("订单提交结果未知，请先查询订单".into()),
+                );
+                return;
+            }
+            let current_ms = now_ms();
+            if task.retryable
+                && task.side_effect == "none"
+                && schedule.attempts < schedule.max_attempts
+                && current_ms.saturating_add(schedule.interval_ms) < schedule.deadline_at_ms
+            {
+                self.update_schedule_status(
+                    &id,
+                    "retrying",
+                    Some(current_ms + schedule.interval_ms),
+                    Some(task.stage),
+                );
+            } else if current_ms >= schedule.deadline_at_ms
+                || schedule.attempts >= schedule.max_attempts
+            {
+                self.finish_schedule(&id, "expired", Some(task.stage));
+            } else {
+                self.finish_schedule(&id, "failed", Some(task.stage));
+            }
+            return;
+        }
+    }
+    fn update_schedule_status(
+        &self,
+        id: &str,
+        status: &str,
+        next_attempt_at_ms: Option<u64>,
+        error: Option<String>,
+    ) {
+        let mut schedules = self.schedules.lock().unwrap();
+        if let Some(schedule) = schedules.get_mut(id) {
+            schedule.status = status.into();
+            schedule.current_task_id = None;
+            schedule.next_attempt_at_ms = next_attempt_at_ms;
+            if let Some(error) = error {
+                schedule.last_error = error;
+            }
+            let _ = self.persist_schedules(&schedules);
+        }
+        drop(schedules);
+        self.schedule_notify.notify_one();
+    }
+    fn finish_schedule(&self, id: &str, status: &str, error: Option<String>) {
+        let mut schedules = self.schedules.lock().unwrap();
+        if let Some(schedule) = schedules.get_mut(id) {
+            schedule.status = status.into();
+            schedule.current_task_id = None;
+            schedule.next_attempt_at_ms = None;
+            if status == "succeeded" {
+                schedule.last_error.clear();
+            }
+            if let Some(error) = error {
+                schedule.last_error = error;
+            }
+            let _ = self.persist_schedules(&schedules);
+        }
+        drop(schedules);
+        self.schedule_notify.notify_one();
     }
     fn remove_invalid_account(&self, id: &str, current_task: &str) -> Result<bool, String> {
         let mut accounts = self.accounts.lock().unwrap();
@@ -486,6 +947,8 @@ impl Engine {
                 prompt: None,
                 result: None,
                 order_submitted: false,
+                retryable: false,
+                side_effect: default_side_effect(),
                 logs: vec![],
             },
         );
@@ -627,7 +1090,12 @@ impl Engine {
             if !completed || !exit.success() { return Err("业务进程意外退出，请查询当前状态后再试".into()); }
             Ok(())
         }.await;
-        let browser_pid = self.controls.lock().unwrap().get(&id).and_then(|c| c.browser_pid);
+        let browser_pid = self
+            .controls
+            .lock()
+            .unwrap()
+            .get(&id)
+            .and_then(|c| c.browser_pid);
         if let Some(pid) = browser_pid {
             stop_process(pid).await;
         }
@@ -653,6 +1121,7 @@ impl Engine {
         self.controls.lock().unwrap().remove(&id);
     }
     pub async fn shutdown(&self) {
+        let _ = self.scheduler_stop.send(true);
         {
             let controls = self.controls.lock().unwrap();
             for control in controls.values() {
@@ -758,6 +1227,8 @@ pub fn apply_event(task: &mut Task, event: &Value) {
         "error" => {
             task.status = "failed".into();
             task.stage = event["message"].as_str().unwrap_or("操作失败").into();
+            task.retryable = event["retryable"] == true;
+            task.side_effect = event["side_effect"].as_str().unwrap_or("unknown").into();
             task.prompt = None;
             if event["account_removed"] == true {
                 task.result = Some(json!({"success": false, "account_removed": true}));
@@ -805,6 +1276,8 @@ mod tests {
             prompt: Some(json!({"id":"p","kind":"code"})),
             result: None,
             order_submitted: false,
+            retryable: false,
+            side_effect: default_side_effect(),
             logs: vec![],
         }
     }
@@ -836,6 +1309,98 @@ mod tests {
         );
     }
     #[test]
+    fn schedules_are_persisted_and_only_one_active_plan_is_allowed_per_account() {
+        let temp = tempfile::tempdir().unwrap();
+        let engine = Engine::new(temp.path().into()).unwrap();
+        let account = engine.add_account("schedule@example.test".into()).unwrap();
+        engine.accounts.lock().unwrap()[0].pending = false;
+        let request = ScheduleRequest {
+            account_id: account.id.clone(),
+            sku: "MK2U4CH".into(),
+            quantity: 1,
+            start_at_ms: now_ms() + 10_000,
+            deadline_at_ms: now_ms() + 60_000,
+            interval_ms: 5_000,
+            max_attempts: 3,
+            auto_confirm: false,
+            max_total: None,
+        };
+        let schedule = engine.create_schedule(request.clone()).unwrap();
+        assert_eq!(schedule.status, "armed");
+        assert_eq!(
+            Engine::new(temp.path().into())
+                .unwrap()
+                .snapshot()
+                .schedules
+                .len(),
+            1
+        );
+        assert!(engine.create_schedule(request).is_err());
+        engine.cancel_schedule(&schedule.id).unwrap();
+        assert_eq!(engine.snapshot().schedules[0].status, "cancelled");
+    }
+
+    #[test]
+    fn retry_metadata_is_taken_from_worker_errors() {
+        let mut task = task();
+        apply_event(
+            &mut task,
+            &json!({
+                "type": "error",
+                "message": "商品尚未开放",
+                "retryable": true,
+                "side_effect": "none"
+            }),
+        );
+        assert!(task.retryable);
+        assert_eq!(task.side_effect, "none");
+    }
+
+    #[tokio::test]
+    async fn scheduler_retries_a_safe_attempt_and_stops_after_success() {
+        let temp = tempfile::tempdir().unwrap();
+        let engine = Engine::new(temp.path().into()).unwrap();
+        let account = engine.add_account("retry@example.test".into()).unwrap();
+        engine.accounts.lock().unwrap()[0].pending = false;
+        let script = temp.path().join("fake-worker.sh");
+        fs::write(
+            &script,
+            "#!/bin/sh\n"
+                .to_owned()
+                + "data=\"\"; account=\"\"; task=\"\"\n"
+                + "while [ \"$#\" -gt 0 ]; do case \"$1\" in --data-dir) data=\"$2\"; shift 2;; --account-id) account=\"$2\"; shift 2;; --task-id) task=\"$2\"; shift 2;; *) shift;; esac; done\n"
+                + "if [ ! -f \"$data/attempted\" ]; then touch \"$data/attempted\"; printf '{\"v\":1,\"account_id\":\"%s\",\"task_id\":\"%s\",\"type\":\"error\",\"message\":\"未开放\",\"retryable\":true,\"side_effect\":\"none\",\"order_submitted\":false,\"account_invalid\":false}\\n' \"$account\" \"$task\"; else printf '{\"v\":1,\"account_id\":\"%s\",\"task_id\":\"%s\",\"type\":\"result\",\"result\":{\"success\":true}}\\n' \"$account\" \"$task\"; fi\n",
+        )
+        .unwrap();
+        let host = TaskHost {
+            worker: PathBuf::from("/bin/sh"),
+            script: Some(script),
+            on_update: Arc::new(|_| {}),
+        };
+        let schedule = engine
+            .create_schedule(ScheduleRequest {
+                account_id: account.id,
+                sku: "MK2U4CH".into(),
+                quantity: 1,
+                start_at_ms: now_ms() + 100,
+                deadline_at_ms: now_ms() + 5_000,
+                interval_ms: 1_000,
+                max_attempts: 2,
+                auto_confirm: false,
+                max_total: None,
+            })
+            .unwrap();
+        engine.start_scheduler(host);
+        for _ in 0..30 {
+            if engine.snapshot().schedules[0].status == "succeeded" {
+                assert_eq!(engine.snapshot().schedules[0].attempts, 2);
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        panic!("schedule {} did not complete", schedule.id);
+    }
+    #[test]
     fn manual_removal_clears_only_target_scope_and_allows_readding() {
         for pending in [true, false] {
             let temp = tempfile::tempdir().unwrap();
@@ -844,7 +1409,11 @@ mod tests {
             let b = engine.add_account("b@example.test".into()).unwrap();
             engine.accounts.lock().unwrap()[0].pending = pending;
             for id in [&a.id, &b.id, LOCAL_ID] {
-                private_json(&scope_dir(temp.path(), id).join("auth.json"), &json!({"fixture":true})).unwrap();
+                private_json(
+                    &scope_dir(temp.path(), id).join("auth.json"),
+                    &json!({"fixture":true}),
+                )
+                .unwrap();
             }
             let mut t = task();
             t.account_id = a.id.clone();
@@ -881,7 +1450,15 @@ mod tests {
         engine.tasks.lock().unwrap().get_mut("t").unwrap().status = "succeeded".into();
         let (cancel, _) = watch::channel(false);
         let (input, _) = mpsc::channel(1);
-        engine.controls.lock().unwrap().insert("t".into(), Control { cancel, input, pid: None, browser_pid: None });
+        engine.controls.lock().unwrap().insert(
+            "t".into(),
+            Control {
+                cancel,
+                input,
+                pid: None,
+                browser_pid: None,
+            },
+        );
         assert!(engine.reserve_removal(&a.id).is_err());
         engine.controls.lock().unwrap().clear();
         assert!(engine.reserve_removal(&a.id).is_ok());
@@ -891,10 +1468,17 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let engine = Engine::new(temp.path().into()).unwrap();
         let a = engine.add_account("a@example.test".into()).unwrap();
-        let host = TaskHost { worker: temp.path().join("missing-worker"), script: None, on_update: Arc::new(|_| {}) };
+        let host = TaskHost {
+            worker: temp.path().join("missing-worker"),
+            script: None,
+            on_update: Arc::new(|_| {}),
+        };
         let reservation = engine.reserve_removal(&a.id).unwrap();
         assert!(engine.reserve_removal(&a.id).is_err());
-        assert!(engine.start(host.clone(), a.id.clone(), "enroll".into(), json!({})).unwrap_err().contains("正在移除"));
+        assert!(engine
+            .start(host.clone(), a.id.clone(), "enroll".into(), json!({}))
+            .unwrap_err()
+            .contains("正在移除"));
         drop(reservation);
         assert!(engine.remove_account(&host, &a.id).await.is_err());
         assert_eq!(engine.snapshot().accounts.len(), 1);
@@ -909,12 +1493,20 @@ mod tests {
         let auth = scope_dir(temp.path(), &a.id).join("auth.json");
         private_json(&auth, &json!({"fixture":true})).unwrap();
         let script = temp.path().join("vault.sh");
-        let host = TaskHost { worker: "/bin/sh".into(), script: Some(script.clone()), on_update: Arc::new(|_| {}) };
+        let host = TaskHost {
+            worker: "/bin/sh".into(),
+            script: Some(script.clone()),
+            on_update: Arc::new(|_| {}),
+        };
         fs::write(&script, "exit 1\n").unwrap();
         assert!(engine.remove_account(&host, &a.id).await.is_err());
         assert!(auth.exists());
         assert_eq!(engine.snapshot().accounts.len(), 1);
-        fs::write(&script, format!("test \"$1\" = --forget-account && test \"$2\" = {}\n", a.id)).unwrap();
+        fs::write(
+            &script,
+            format!("test \"$1\" = --forget-account && test \"$2\" = {}\n", a.id),
+        )
+        .unwrap();
         engine.remove_account(&host, &a.id).await.unwrap();
         assert!(!auth.exists());
         assert!(engine.snapshot().accounts.is_empty());

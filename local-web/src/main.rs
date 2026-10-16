@@ -12,7 +12,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use engine::{Engine, Task, TaskHost};
+use engine::{Engine, Schedule, ScheduleRequest, Task, TaskHost};
 use fs2::FileExt;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -46,6 +46,8 @@ struct Input {
     #[serde(default)]
     task_id: String,
     #[serde(default)]
+    schedule_id: String,
+    #[serde(default)]
     request_id: String,
     #[serde(default)]
     value: Value,
@@ -53,6 +55,8 @@ struct Input {
     sku: String,
     #[serde(default)]
     quantity: u32,
+    #[serde(default)]
+    request: Option<ScheduleRequest>,
 }
 
 async fn command(
@@ -62,8 +66,23 @@ async fn command(
 ) -> Response {
     let result: Result<Value, String> = match command.as_str() {
         "snapshot" => Ok(json!(s.engine.snapshot())),
+        "create_schedule" => match p.request {
+            Some(request) => s
+                .engine
+                .create_schedule(request)
+                .map(|schedule: Schedule| json!(schedule)),
+            None => Err("缺少定时抢单参数".into()),
+        },
+        "cancel_schedule" => s
+            .engine
+            .cancel_schedule(&p.schedule_id)
+            .map(|_| Value::Null),
         "add_account" => s.engine.add_account(p.email).map(|a| json!(a)),
-        "remove_account" => s.engine.remove_account(&s.host, &p.account_id).await.map(|_| Value::Null),
+        "remove_account" => s
+            .engine
+            .remove_account(&s.host, &p.account_id)
+            .await
+            .map(|_| Value::Null),
         "save_preset" => s
             .engine
             .save_preset(&p.account_id, p.sku, p.quantity)
@@ -280,15 +299,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let (sender, _) = broadcast::channel(256);
     let sink = sender.clone();
     let (shutdown, stopping) = watch::channel(false);
+    let host = TaskHost {
+        worker,
+        script,
+        on_update: Arc::new(move |task| {
+            let _ = sink.send(task.clone());
+        }),
+    };
+    engine.start_scheduler(host.clone());
     let state = LocalState {
         engine: engine.clone(),
-        host: TaskHost {
-            worker,
-            script,
-            on_update: Arc::new(move |task| {
-                let _ = sink.send(task.clone());
-            }),
-        },
+        host,
         events: sender,
         stopping,
         authority,

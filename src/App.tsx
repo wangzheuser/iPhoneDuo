@@ -23,6 +23,7 @@ import {
   DuoStatus,
   LocalSettings,
   ProductSelect,
+  SchedulePage,
   RouteNav,
   useRoute,
 } from "./LocalPages";
@@ -54,6 +55,7 @@ const tabs = [
 const initial: Snapshot = {
   accounts: [],
   tasks: [],
+  schedules: [],
   data_dir: "",
 };
 const errorText = (e: unknown) =>
@@ -273,6 +275,12 @@ export default function App() {
         bridge={bridge}
         refresh={refreshSnapshot}
       />
+    ) : route === "schedule" ? (
+      <SchedulePage
+        snapshot={snapshot}
+        bridge={bridge}
+        refresh={refreshSnapshot}
+      />
     ) : null);
   return (
     <div className="app-shell">
@@ -367,7 +375,9 @@ export default function App() {
               ? "本地配置"
               : route === "duo"
                 ? "DUO 状态"
-                : format(account?.name || "账号管理")}
+                : route === "schedule"
+                  ? "定时抢单"
+                  : format(account?.name || "账号管理")}
           </span>
           <div className="topbar-tools">
             {(route !== "workspace" || !sessionReady || !account) && (

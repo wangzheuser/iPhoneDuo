@@ -99,6 +99,12 @@ test("dev command serves real source tasks, hot updates, and releases its worksp
   await expect(
     page.locator(".sidebar").getByRole("navigation", { name: "页面导航" }),
   ).toBeVisible();
+  await page.getByRole("link", { name: "定时抢单", exact: true }).click();
+  await expect(page).toHaveURL(/#\/schedule$/);
+  await expect(page.getByRole("heading", { name: "定时抢单" })).toBeVisible();
+  await expect(
+    page.getByText("暂无定时抢单计划。", { exact: true }),
+  ).toBeVisible();
   await page.screenshot({
     path: "artifacts/dev-login-sidebar.png",
     fullPage: true,

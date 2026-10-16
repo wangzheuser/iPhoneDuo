@@ -3,6 +3,7 @@
 # 找一下Apple 的bug 😁
 """-k SKU 登录、加购并确认下单；-l 登录；-a [SKU] 加购；-p 确认下单；-purl [URL] 获取付款码。"""
 import argparse
+from decimal import Decimal, InvalidOperation
 import hashlib
 import json
 import logging
@@ -44,6 +45,10 @@ LOG_PATH = ROOT / "duo_killer.log"
 PAYMENT_ROOT = None
 log = logging.getLogger("duo_killer")
 log.disabled = True
+
+
+class RetryablePurchaseError(ValueError):
+    """服务端明确拒绝且尚未改变购物袋，可安全进入下一次尝试。"""
 
 
 def resolve_auth_path(value):
@@ -601,6 +606,7 @@ def add_to_bag(part=PART, quantity=1, *, set_total=False, flow=None):
                 module = f"shoppingCart.items.{item_id}.itemQuantity"
                 print(f"更新购物袋：{part}，数量 {current} → {target}")
                 # 复用当前页面令牌和 Session；action 会处理响应中的 meta.l 和新令牌。
+                interaction.report_stage("正在更新购物袋", side_effect="unknown")
                 flow.action(module, "updateQuantity", {module + ".quantity": str(target)})
             item_id, item = cart_item(flow, part)
             if item is None or int(field(item, "itemQuantity.d.quantity", 0)) != target:
@@ -643,6 +649,7 @@ def _add_one_to_bag(session, part):
     # 加购只发送一次；导航或网络出错后查袋确认，不自动重试。
     add_error = ""
     try:
+        interaction.report_stage("正在请求加购", side_effect="unknown")
         response = request_get(session, "执行加购", BASE_URL + "/cn/shop/bag/add", params=params)
         response.raise_for_status()
         result = response.json()
@@ -651,8 +658,13 @@ def _add_one_to_bag(session, part):
         code = result.get("errorCode", result.get("responseCode", "unknown"))
         log.info("[加购结果] addedToBag=%s，responseCode=%s，bagQuantity=%s",
                  result.get("addedToBag"), code, result.get("bagQuantity"))
+        if result.get("addedToBag") is False:
+            interaction.report_stage("商品尚未开放，等待下一次尝试", side_effect="none")
+            raise RetryablePurchaseError(f"加购接口未确认成功（{code}）。")
         if result.get("addedToBag") is not True:
             add_error = f"加购接口未确认成功（{code}）。"
+    except RetryablePurchaseError:
+        raise
     except ValueError:
         add_error = "加购接口返回了无法识别的 JSON 响应。"
     except requests.RequestException as error:
@@ -849,7 +861,18 @@ def order_price(value):
     return text
 
 
-def confirm_order(model):
+def amount_value(value):
+    text = order_text(value).replace(",", "")
+    match = re.search(r"\d+(?:\.\d{1,2})?", text)
+    if not match:
+        raise ValueError("订单金额无法转换，未提交订单。")
+    try:
+        return Decimal(match.group(0))
+    except InvalidOperation:
+        raise ValueError("订单金额无法转换，未提交订单。") from None
+
+
+def confirm_order(model, *, auto_confirm=False, max_total=None, expected_items=None):
     review = field(model, "checkout.review", {})
     rows = []
     for item in model_item_nodes(review.get("fulfillmentReview", {})):
@@ -861,6 +884,9 @@ def confirm_order(model):
         rows.append(f"{len(rows) + 1}. {name} × {quantity}  小计 {order_price(field(item, 'd.totalPrice'))}")
     if not rows:
         raise ValueError("订单复核页没有商品，未提交订单。")
+    actual_items = model_items(review.get("fulfillmentReview", {}))
+    if expected_items is not None and actual_items != sorted(expected_items):
+        raise ValueError("购物袋包含非目标商品或数量不一致，未提交订单。")
     summary = field(review, "summary.d", {})
     total = order_price(summary.get("totalAfterTradeIn") if summary.get("showTotalAfterTradeinAsTotal")
                         else field(summary, "installmentTotal.value") or summary.get("total"))
@@ -874,12 +900,21 @@ def confirm_order(model):
     if delivery:
         print("送货地址：" + order_text(delivery))
     print(f"\n总支付：{total}")
+    if max_total is not None:
+        try:
+            limit = Decimal(str(max_total))
+        except InvalidOperation:
+            raise ValueError("最高总金额格式无效，未提交订单。") from None
+        if limit <= 0 or amount_value(total) > limit:
+            raise ValueError(f"订单总金额超过最高限额 {max_total}，未提交订单。")
     if interaction.handler is not None:
         details = {"items": [{"name": order_text(field(item, "d.name") or field(item, "d.productName") or field(item, "d.sku")),
                               "sku": field(item, "d.sku"), "quantity": int(field(item, "itemQuantity.d.quantity")),
                               "subtotal": order_price(field(item, "d.totalPrice"))}
                              for item in model_item_nodes(review.get("fulfillmentReview", {}))],
                    "total": total, "store": order_text(store), "address": order_text(delivery)}
+        if auto_confirm:
+            return
         if interaction.handler.confirm(details) is not True:
             raise ValueError("已取消下单，购物袋已保留。")
         return
@@ -928,7 +963,7 @@ def finish_payment(flow):
     raise ValueError("订单仍在处理中，请稍后运行 -o 查询订单。")
 
 
-def pay_bag(*, flow=None):
+def pay_bag(*, flow=None, auto_confirm=False, max_total=None, expected_items=None):
     standalone = flow is None
     with (requests.Session() if standalone else nullcontext(flow.session)) as session:
         if standalone:
@@ -957,6 +992,7 @@ def pay_bag(*, flow=None):
                 address = ".delivery.lineDeliveryOptions.address.provinceCityDistrictTabs"
                 for name in ("state", "provinceCityDistrict", "countryCode"):
                     data[prefix + address + "." + name] = field(item, address[1:] + ".d." + name, "CN" if name == "countryCode" else "")
+            interaction.report_stage("正在进入结账", side_effect="unknown")
             flow.action("shoppingCart.actions", "checkout", data)
             reauthenticate_checkout(flow)
             checkout_delivery(flow)
@@ -973,7 +1009,12 @@ def pay_bag(*, flow=None):
                     field(review, "billingReview.alipayReview.d.alipayLabel") != "ALIPAY" or
                     model_items(review.get("fulfillmentReview", {})) != expected):
                 raise ValueError("订单复核未通过：商品、数量、支付方式或下单状态不符合预期。")
-            confirm_order(flow.model)
+            confirm_order(
+                flow.model,
+                auto_confirm=auto_confirm,
+                max_total=max_total,
+                expected_items=expected_items,
+            )
             save_auth(session)
             interaction.report_stage("正在提交订单", order_submitted=True)
             flow.action("checkout.review.placeOrder", "continueFromReviewToProcess")
@@ -989,7 +1030,7 @@ def pay_bag(*, flow=None):
                 save_auth(session)
 
 
-def purchase_sku(part, sms=False, quantity=1):
+def purchase_sku(part, sms=False, quantity=1, *, auto_confirm=False, max_total=None):
     part = normalize_sku(part)
     if type(quantity) is not int or quantity < 1:
         raise ValueError("加购数量必须是正整数。")
@@ -1017,6 +1058,13 @@ def purchase_sku(part, sms=False, quantity=1):
                 print("商城已登录。")
             print(f"目标购买数量：{part} × {quantity}")
             add_to_bag(part, quantity=quantity, set_total=True, flow=flow)
+            if auto_confirm or max_total is not None:
+                return pay_bag(
+                    flow=flow,
+                    auto_confirm=auto_confirm,
+                    max_total=max_total,
+                    expected_items=[(normalize_sku(part), quantity)] if auto_confirm else None,
+                )
             return pay_bag(flow=flow)
         finally:
             save_auth(session)

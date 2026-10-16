@@ -1,6 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 mod engine;
-use engine::{Account, Engine, Snapshot, TaskHost};
+use engine::{Account, Engine, Schedule, ScheduleRequest, Snapshot, TaskHost};
 use serde_json::Value;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -11,6 +11,17 @@ use tauri::{Emitter, Manager, State};
 #[tauri::command]
 fn snapshot(state: State<'_, Arc<Engine>>) -> Snapshot {
     state.snapshot()
+}
+#[tauri::command]
+fn create_schedule(
+    state: State<'_, Arc<Engine>>,
+    request: ScheduleRequest,
+) -> Result<Schedule, String> {
+    state.create_schedule(request)
+}
+#[tauri::command]
+fn cancel_schedule(state: State<'_, Arc<Engine>>, schedule_id: String) -> Result<(), String> {
+    state.cancel_schedule(&schedule_id)
 }
 #[tauri::command]
 fn add_account(state: State<'_, Arc<Engine>>, email: String) -> Result<Account, String> {
@@ -103,18 +114,22 @@ fn main() {
                     }),
                 None,
             );
-            app.manage(TaskHost {
+            let host = TaskHost {
                 worker,
                 script,
                 on_update: Arc::new(move |task| {
                     let _ = handle.emit("task-updated", task);
                 }),
-            });
+            };
+            engine.start_scheduler(host.clone());
+            app.manage(host);
             app.manage(engine);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             snapshot,
+            create_schedule,
+            cancel_schedule,
             add_account,
             remove_account,
             save_preset,

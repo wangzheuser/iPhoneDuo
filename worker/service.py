@@ -28,6 +28,7 @@ class Service:
         self.authentication_failed = False
         self.action = None
         self.submitted = False
+        self.side_effect = 'none'
         self.auth = self.root / 'auth.json'
         self.checkout = self.root / 'checkout.json'
         duo_killer.ROOT, duo_killer.AUTH_PATH, duo_killer.LOG_PATH = self.root, self.auth, self.task_dir / 'requests.log'
@@ -103,6 +104,8 @@ class Service:
 
     def stage(self, stage, **fields):
         self.authentication_failed = self.authentication_failed or fields.get('authentication_failed', False)
+        if fields.get('side_effect'):
+            self.side_effect = fields['side_effect']
         if 'browser_pid' in fields:
             self.channel.emit('stage', message=stage, **fields)
             self.channel.checkpoint()
@@ -218,7 +221,16 @@ class Service:
         elif action == 'login':
             result = duo_killer.login(sms=params.get('sms') is True)
         elif action == 'purchase':
-            result = duo_killer.purchase_sku(params.get('sku', 'MK2U4CH'), quantity=quantity(params))
+            purchase_options = {}
+            if params.get('auto_confirm') is True:
+                purchase_options['auto_confirm'] = True
+            if params.get('max_total') is not None:
+                purchase_options['max_total'] = params.get('max_total')
+            result = duo_killer.purchase_sku(
+                params.get('sku', 'MK2U4CH'),
+                quantity=quantity(params),
+                **purchase_options,
+            )
         elif action == 'add':
             result = duo_killer.add_to_bag(params.get('sku', ''), quantity=quantity(params), set_total=True)
         elif action == 'checkout':
@@ -264,6 +276,16 @@ class Service:
                 raise ValueError('二维码文件不在当前任务目录。')
             result['qr_data'] = 'data:image/png;base64,' + base64.b64encode(path.read_bytes()).decode()
         return result
+
+    def retryable(self, error):
+        """Return true only when another attempt cannot repeat a remote mutation."""
+        return (
+            self.action == 'purchase'
+            and not self.submitted
+            and self.side_effect == 'none'
+            and not self.authentication_failed
+            and isinstance(error, (ValueError, requests.RequestException, OSError))
+        )
 
 
 def quantity(params):

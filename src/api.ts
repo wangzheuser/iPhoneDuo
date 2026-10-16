@@ -1,10 +1,20 @@
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import type { Account, Action, Data, Snapshot, Task } from "./types";
+import type {
+  Account,
+  Action,
+  Data,
+  Schedule,
+  ScheduleRequest,
+  Snapshot,
+  Task,
+} from "./types";
 import { localWebBridge } from "./web-api";
 export const isLocalWeb = import.meta.env.MODE === "local-web";
 export interface Bridge {
   snapshot(): Promise<Snapshot>;
+  createSchedule(request: ScheduleRequest): Promise<Schedule>;
+  cancelSchedule(scheduleId: string): Promise<void>;
   add(email: string): Promise<Account>;
   remove(accountId: string): Promise<void>;
   savePreset(
@@ -29,6 +39,8 @@ declare global {
 }
 const native: Bridge = {
   snapshot: () => invoke("snapshot"),
+  createSchedule: (request) => invoke("create_schedule", { request }),
+  cancelSchedule: (scheduleId) => invoke("cancel_schedule", { scheduleId }),
   add: (email) => invoke("add_account", { email }),
   remove: (accountId) => invoke("remove_account", { accountId }),
   savePreset: (accountId, sku, quantity) =>

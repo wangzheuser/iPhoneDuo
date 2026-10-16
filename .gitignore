@@ -33,3 +33,4 @@ local-web/target/
 local-web-release/
 .local-web-build-*/
 .local-web-previous-*/
+.local-web-dev-data/
